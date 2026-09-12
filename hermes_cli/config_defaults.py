@@ -627,8 +627,9 @@ DEFAULT_CONFIG = {
         # path.
         "in_place": True,
         # Per-model threshold overrides: keys substring-match the model name (longest wins), values
-        # replace the global `threshold`, e.g. {"glm-5.2": 0.40}. The <512K floor (0.75) still
-        # applies raise-only on top.
+        # replace the global `threshold`, e.g. {"glm-5.2": 0.40}. Prefix a key with "<provider>:" to
+        # scope it to one route ({"openai-codex:astra": 0.85} leaves Astra on OpenRouter/Nous at the
+        # global value). The <512K floor (0.75) still applies raise-only on top.
         "model_thresholds": {},
         # Opt-in idle compaction (0 = off): a session resuming after this many idle seconds compacts
         # up front, before the first reply. Time-based complement to `threshold`; skipped when
@@ -1115,6 +1116,19 @@ DEFAULT_CONFIG = {
     },
 
     "voice": {
+        # How the Desktop voice conversation is wired:
+        #   chained  — STT → Hermes turn → TTS (the stt.* / tts.* providers below)
+        #   gpt-live — one full-duplex voice model (OpenAI GPT-Live) owns the mic and speaker and
+        #              DELEGATES every real request to Hermes (any model / provider you have
+        #              selected); needs an OpenAI API key. $0.05/min voice layer billing.
+        "voice_chat_mode": "chained",
+        "gpt_live": {
+            "model": "gpt-live-1",
+            "voice": "marin",  # marin | quartz | ripple | vesper | willow | stone | gleam | meridian | ...
+            # Extra sentences appended to the live model's conversation persona (tone, pacing, language).
+            "instructions": "",
+            # optional "api_key" / "base_url" keys override the OpenAI audio credentials for this mode only
+        },
         "record_key": "ctrl+b",
         "submit_mode": "direct",  # TUI: direct submits immediately; draft = editable transcript
         "max_recording_seconds": 120,
@@ -1358,6 +1372,7 @@ DEFAULT_CONFIG = {
         # See #79686.
         "ledger": True,
     },
+
     # Curator — background maintenance of AGENT-CREATED skills (never hub-installed): marks
     # long-unused skills stale, archives (never deletes) obsolete ones, optionally consolidates
     # overlaps via a forked aux-model agent. Inactivity-triggered from session start, no cron
