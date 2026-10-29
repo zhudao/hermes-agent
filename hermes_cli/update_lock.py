@@ -47,6 +47,9 @@ CREATE_TIME_TOLERANCE_SECONDS = 2.0
 # Our own creation time re-probed by the same clock: only the marker's 3-decimal rounding differs,
 # while two processes are at least one scheduler tick (10 ms) apart.
 _OWN_CREATE_TIME_EPSILON = 0.005
+# macOS shells read a creation time from `ps -o lstart` and write it as whole seconds (`ct:N.000`),
+# truncated. A whole-second claim inside the second we started in is still our incarnation.
+_WHOLE_SECOND_CT = 1.0
 
 # A claim published by create-then-write (filesystems without hard links) is briefly empty; an
 # empty marker this young is a claim in flight, not a dead one (contract A3).
@@ -205,6 +208,7 @@ def _stdlib_create_time(pid: int) -> float | None:
             ["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
             encoding="utf-8", errors="replace", timeout=5, stdin=subprocess.DEVNULL,
             env={"PATH": os.environ.get("PATH") or "/bin:/usr/bin", "LC_ALL": "C", "TZ": "UTC0"},
+            check=False,
         ).stdout.strip()
         if not out:
             return None
@@ -295,7 +299,11 @@ def _incarnation(pid: int, recorded: float | None, w: _World) -> bool | None:
     if pid == w.pid:  # we are alive by definition: only the incarnation is in question
         if w.ct is None:
             return recorded is None
-        return recorded is not None and abs(w.ct - recorded) <= _OWN_CREATE_TIME_EPSILON
+        if recorded is None:
+            return False
+        if abs(w.ct - recorded) <= _OWN_CREATE_TIME_EPSILON:
+            return True
+        return recorded.is_integer() and 0 <= w.ct - recorded < _WHOLE_SECOND_CT
     if not w.alive(pid):
         return False
     actual = None if recorded is None else w.ct_of(pid)
@@ -971,7 +979,15 @@ _HELD: dict | None = None
 _JOBS: list = []
 
 
-def _try_lock(fd: int) -> bool:
+def _try_lock(fd: int, *, shared: bool = False) -> bool:
+    """Lock the owner byte and every lease byte without waiting; False when any is held.
+
+    ``shared`` is the held? probe (:func:`checkout_lock_held`): holders lock exclusively, so a
+    shared try fails only on a holder and two probes never read each other as one. POSIX drops it
+    when the caller closes ``fd``; Windows gives it straight back.
+    """
+    if shared:
+        return _try_shared_lock(fd)
     if sys.platform == "win32":
         if not _lock_bytes(fd, _WINDOWS_LOCK_OFFSET):
             return False
@@ -984,6 +1000,40 @@ def _try_lock(fd: int) -> bool:
 
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    return True
+
+
+def _try_shared_lock(fd: int) -> bool:
+    if sys.platform == "win32":
+        # msvcrt has no shared mode: LockFileEx without LOCKFILE_EXCLUSIVE_LOCK over the owner byte
+        # and the 16 lease bytes. Any failure answers held, as the exclusive probe did.
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+
+        class _Overlapped(ctypes.Structure):
+            _fields_ = [("Internal", ctypes.c_void_p), ("InternalHigh", ctypes.c_void_p),
+                        ("Offset", wintypes.DWORD), ("OffsetHigh", wintypes.DWORD), ("hEvent", wintypes.HANDLE)]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.LockFileEx.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
+                                        wintypes.DWORD, ctypes.POINTER(_Overlapped)]
+        kernel32.LockFileEx.restype = wintypes.BOOL
+        kernel32.UnlockFileEx.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
+                                          ctypes.POINTER(_Overlapped)]
+        kernel32.UnlockFileEx.restype = wintypes.BOOL
+        handle = wintypes.HANDLE(msvcrt.get_osfhandle(fd))
+        span = 1 + _LEASE_SLOTS
+        if not kernel32.LockFileEx(handle, 0x1, 0, span, 0, ctypes.byref(_Overlapped(Offset=_WINDOWS_LOCK_OFFSET))):
+            return False  # 0x1 = LOCKFILE_FAIL_IMMEDIATELY
+        kernel32.UnlockFileEx(handle, 0, span, 0, ctypes.byref(_Overlapped(Offset=_WINDOWS_LOCK_OFFSET)))
+        return True
+    import fcntl
+
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
     except BlockingIOError:
         return False
     return True
@@ -1318,9 +1368,12 @@ def update_in_progress(install_root: Path | str | None = None) -> bool:
 def checkout_lock_held(install_root: Path | str | None = None) -> bool:
     """True while some process (this one included) holds the checkout kernel lock.
 
-    A probe takes the lock for the microseconds of one try and drops it (closing the fd), the
-    way ``marker.sh::checkout_lock_held`` does; an updater acquiring at that instant waits
-    :data:`CHECKOUT_CONTENTION_WAIT_SECONDS` instead of failing (R6/D17).
+    A probe takes a SHARED lock on the owner byte and every lease byte for the microseconds of one
+    try and drops it (closing the fd). Holders lock exclusively, so the probe fails only on a real
+    holder, while two probes never read each other as one: a client polling ``ensure`` and the
+    gateway it just started both probe while a killed update's dead marker is still there. An
+    updater acquiring at that instant waits :data:`CHECKOUT_CONTENTION_WAIT_SECONDS` instead of
+    failing (R6/D17).
 
     Only a missing lock file is free. One that exists but cannot be opened answers held, the same
     verdict ``marker.sh`` / ``marker.ps1`` and the Desktop probes give, so no reader admits a
@@ -1337,10 +1390,7 @@ def checkout_lock_held(install_root: Path | str | None = None) -> bool:
     except OSError:
         return True
     try:
-        if not _try_lock(fd):
-            return True
-        _unlock(fd)
-        return False
+        return not _try_lock(fd, shared=True)
     except OSError:
         return False
     finally:
@@ -1568,7 +1618,7 @@ class UpdateLock:
             self.acquired = self._claimed = False
             self._drop_checkout()
 
-    def __enter__(self) -> "UpdateLock":
+    def __enter__(self) -> UpdateLock:
         self.acquire()
         return self
 
